@@ -146,6 +146,9 @@ export function useInterview() {
       case 'listening':
         setPhase('listening')
         setIsListening(true)
+        // Bug 4 fix: tell the mic handler a new turn started so the
+        // silence countdown can fire again for this turn
+        hasSpeechRef.current = false
         break
 
       case 'interrupt_ack':
@@ -208,6 +211,7 @@ export function useInterview() {
           silenceStarted       = false
           resetSilenceTimer()
 
+          // Bug 3 fix: interrupt AI if user starts speaking while TTS plays
           if (isPlayingRef.current) {
             stopAudioPlayback()
             ws.send(JSON.stringify({ type: 'interrupt' }))
@@ -219,6 +223,11 @@ export function useInterview() {
             startSilenceTimer()
           }
         }
+
+        // Bug 3 fix: do NOT send audio bytes while AI is speaking TTS.
+        // The backend ignores them anyway, but sending wastes bandwidth and
+        // can confuse the VAD silence timer on the next turn.
+        if (isPlayingRef.current) return
 
         // float32 → int16 PCM → send
         const int16 = new Int16Array(float32.length)

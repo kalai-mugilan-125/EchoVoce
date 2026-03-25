@@ -24,8 +24,8 @@ logger = get_logger(__name__)
 class VADService:
     def __init__(self):
         self._model = None
-        self._get_speech_ts = None
         self._silence_start: float | None = None
+        self._has_speech_occurred: bool = False   # Bug 5 fix: don't fire before user speaks
         self._is_loaded = False
 
     def load(self):
@@ -41,7 +41,6 @@ class VADService:
                 trust_repo=True,
             )
             self._model = model
-            # get_speech_timestamps is available but we use per-chunk inference
             self._is_loaded = True
             logger.info("VAD model loaded (CPU)")
         except Exception as e:
@@ -49,11 +48,12 @@ class VADService:
             raise
 
     def _audio_to_tensor(self, audio_bytes: bytes) -> torch.Tensor:
-        """Convert raw PCM int16 bytes → float32 tensor normalised to [-1, 1]."""
+        """Convert raw PCM int16 bytes → float32 tensor normalised to [-1, 1].
+        Bug 1 fix: use torch.from_numpy() — torch.from_tensor() does not exist.
+        """
         audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
         audio_np /= 32768.0
-        return torch.from_tensor(audio_np) if hasattr(torch, "from_tensor") \
-            else torch.tensor(audio_np)
+        return torch.from_numpy(audio_np)
 
     def is_speech(self, audio_bytes: bytes) -> tuple[bool, float]:
         """
@@ -92,7 +92,7 @@ class VADService:
           • speech_detected (bool)
           • confidence (float)
           • silence_duration (float) — seconds of continuous silence
-          • should_stop_input (bool) — True after 5s silence
+          • should_stop_input (bool) — True after 5s silence (only after first speech)
           • interrupt_ai (bool) — True if user spoke while AI was talking
         """
         speech, confidence = self.is_speech(audio_bytes)
@@ -102,19 +102,20 @@ class VADService:
             interrupt_ai = True
             logger.info("Interrupt detected — user spoke while AI was talking")
 
-        # Track silence window
+        # Track silence window — Bug 5 fix: only start timing AFTER user has spoken
         should_stop = False
         silence_duration = 0.0
 
         if speech:
-            self._silence_start = None  # reset silence timer
-        else:
+            self._has_speech_occurred = True
+            self._silence_start = None          # reset silence timer on any speech
+        elif self._has_speech_occurred:         # only track silence after first speech
             if self._silence_start is None:
                 self._silence_start = time.monotonic()
             silence_duration = time.monotonic() - self._silence_start
             if silence_duration >= settings.VAD_SILENCE_THRESHOLD:
                 should_stop = True
-                self._silence_start = None  # reset after firing
+                self._silence_start = None      # reset after firing
 
         return {
             "speech_detected": speech,
@@ -127,6 +128,7 @@ class VADService:
     def reset(self):
         """Reset silence tracking — call at start of each user turn."""
         self._silence_start = None
+        self._has_speech_occurred = False       # Bug 5 fix: reset speech gate per turn
 
 
 # Singleton

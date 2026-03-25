@@ -196,17 +196,7 @@ async def websocket_interview(websocket: WebSocket):
                     vad_service.reset()
 
                     if len(accumulated) > 3200:
-                        # ── DEBUG: Save exact bytes from browser to hear what Whisper hears
-                        import wave
-                        import os
-                        with wave.open(os.path.join(os.path.dirname(__file__), "..", "debug_browser.wav"), "wb") as wf:
-                            wf.setnchannels(1)
-                            wf.setsampwidth(2)
-                            wf.setframerate(16000)
-                            wf.writeframes(accumulated)
-                        logger.info(f"[{session.session_id[:8]}] Saved {len(accumulated)} bytes to debug_browser.wav")
-                        # ── END DEBUG
-
+                        logger.info(f"[{session.session_id[:8]}] Sending {len(accumulated)} bytes to STT")
                         asyncio.create_task(
                             _process_audio(websocket, session, accumulated)
                         )
