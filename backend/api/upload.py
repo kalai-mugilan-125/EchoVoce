@@ -80,6 +80,7 @@ async def upload_resume(
 
     # Save to disk (optional — useful for debugging)
     save_path = Path(settings.UPLOAD_DIR) / f"{session_id}_resume{ext}"
+    save_path.parent.mkdir(parents=True, exist_ok=True)
     async with aiofiles.open(save_path, "wb") as f:
         await f.write(file_bytes)
 

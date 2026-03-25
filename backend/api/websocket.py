@@ -9,7 +9,6 @@ directly into the LLM — no audio needed for the first turn.
 
 import asyncio
 import json
-import re
 from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.routing import APIRouter
 
@@ -42,39 +41,37 @@ async def _send_bytes(ws: WebSocket, data: bytes):
         pass
 
 
-async def _stream_tts(ws: WebSocket, session: InterviewSession, text: str):
-    """Split text into sentences, synthesise each one, stream WAV to client."""
-    session.is_ai_speaking = True
+async def _synthesise_and_send(ws: WebSocket, session: InterviewSession, sentence: str) -> bool:
+    """
+    Synthesise a single sentence with TTS and send the WAV over WebSocket.
+    Returns False if interrupted, True otherwise.
+    """
+    if session.interrupt_requested:
+        logger.info(f"[{session.session_id[:8]}] TTS interrupted")
+        session.clear_interrupt()
+        await _send_json(ws, {"type": "interrupt_ack"})
+        session.is_ai_speaking = False
+        return False
+
     loop = asyncio.get_event_loop()
-
-    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
-    if not sentences:
-        sentences = [text.strip()]
-
-    for sentence in sentences:
-        if session.interrupt_requested:
-            logger.info(f"[{session.session_id[:8]}] TTS interrupted")
-            session.clear_interrupt()
-            await _send_json(ws, {"type": "interrupt_ack"})
-            session.is_ai_speaking = False
-            return
-
-        await _send_json(ws, {"type": "tts_start", "sentence": sentence})
-        wav = await loop.run_in_executor(None, tts_service.synthesise, sentence)
-        if wav:
-            await _send_bytes(ws, wav)
-        await _send_json(ws, {"type": "tts_end"})
-        await asyncio.sleep(0.05)
-
-    session.is_ai_speaking = False
-    await _send_json(ws, {"type": "listening"})
+    await _send_json(ws, {"type": "tts_start", "sentence": sentence})
+    wav = await loop.run_in_executor(None, tts_service.synthesise, sentence)
+    if wav:
+        await _send_bytes(ws, wav)
+    await _send_json(ws, {"type": "tts_end"})
+    await asyncio.sleep(0.05)
+    return True
 
 
 async def _run_pipeline(ws: WebSocket, session: InterviewSession, user_text: str):
     """
-    user_text → LLM → TTS → WebSocket.
+    user_text → LLM (streaming sentences) → TTS → WebSocket.
+
+    Each sentence is synthesised with Piper TTS as soon as the LLM yields it,
+    so audio playback starts after the first sentence — no need to wait for
+    the full LLM response.
+
     Acquires a per-session async lock so only one pipeline runs at a time.
-    This prevents the OSError access violation from concurrent llama-cpp calls.
     """
     lock = _processing_locks.setdefault(session.session_id, asyncio.Lock())
 
@@ -90,24 +87,58 @@ async def _run_pipeline(ws: WebSocket, session: InterviewSession, user_text: str
             session.add_message("user", user_text)
         messages = session.get_history_dicts()
 
-        logger.info(f"[{session.session_id[:8]}] LLM: '{user_text[:80]}'")
+        logger.info(f"[{session.session_id[:8]}] LLM streaming: '{user_text[:80]}'")
+        session.is_ai_speaking = True
 
-        response = await loop.run_in_executor(
-            None,
-            lambda: llm_service.generate(messages, stream=False)
-        )
-        response = (response or "").strip()
+        full_response_parts: list[str] = []
 
-        if not response:
+        # Run the blocking sentence generator in a thread and consume it
+        # asynchronously so the event loop stays responsive.
+        sentence_queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        def _produce_sentences():
+            """Runs in a thread pool — feeds sentences into the async queue safely."""
+            try:
+                for sentence in llm_service.generate_stream_sentences(messages):
+                    loop.call_soon_threadsafe(sentence_queue.put_nowait, sentence)
+            except Exception as exc:
+                logger.error(f"LLM stream error in producer: {exc}")
+            finally:
+                loop.call_soon_threadsafe(sentence_queue.put_nowait, None)  # sentinel
+
+        producer = loop.run_in_executor(None, _produce_sentences)
+
+        interrupted = False
+        while True:
+            sentence = await sentence_queue.get()
+            if sentence is None:  # LLM finished
+                break
+
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+
+            full_response_parts.append(sentence)
+            logger.info(f"[{session.session_id[:8]}] TTS sentence: '{sentence[:60]}'")
+
+            ok = await _synthesise_and_send(ws, session, sentence)
+            if not ok:
+                interrupted = True
+                break
+
+        # Make sure the producer thread is done before releasing the lock
+        await producer
+
+        full_response = " ".join(full_response_parts).strip()
+        if full_response:
+            session.add_message("assistant", full_response)
+            session.question_count += 1
+            logger.info(f"[{session.session_id[:8]}] Full response: '{full_response[:80]}'")
+        else:
             logger.warning(f"[{session.session_id[:8]}] Empty LLM response")
-            await _send_json(ws, {"type": "listening"})
-            return
 
-        logger.info(f"[{session.session_id[:8]}] Response: '{response[:80]}'")
-        session.add_message("assistant", response)
-        session.question_count += 1
-
-        await _stream_tts(ws, session, response)
+        if not interrupted:
+            logger.info(f"[{session.session_id[:8]}] LLM generation complete. Waiting for TTS playback to finish.")
 
 
 async def _process_audio(ws: WebSocket, session: InterviewSession, audio_bytes: bytes):
@@ -165,6 +196,17 @@ async def websocket_interview(websocket: WebSocket):
                     vad_service.reset()
 
                     if len(accumulated) > 3200:
+                        # ── DEBUG: Save exact bytes from browser to hear what Whisper hears
+                        import wave
+                        import os
+                        with wave.open(os.path.join(os.path.dirname(__file__), "..", "debug_browser.wav"), "wb") as wf:
+                            wf.setnchannels(1)
+                            wf.setsampwidth(2)
+                            wf.setframerate(16000)
+                            wf.writeframes(accumulated)
+                        logger.info(f"[{session.session_id[:8]}] Saved {len(accumulated)} bytes to debug_browser.wav")
+                        # ── END DEBUG
+
                         asyncio.create_task(
                             _process_audio(websocket, session, accumulated)
                         )
@@ -233,6 +275,12 @@ async def websocket_interview(websocket: WebSocket):
                 elif msg_type == "interrupt":
                     if session:
                         session.request_interrupt()
+
+                elif msg_type == "tts_playback_done":
+                    if session:
+                        session.is_ai_speaking = False
+                        await _send_json(websocket, {"type": "listening"})
+                        logger.info(f"[{session.session_id[:8]}] TTS playback done. Listening...")
 
                 elif msg_type == "ping":
                     await _send_json(websocket, {"type": "pong"})

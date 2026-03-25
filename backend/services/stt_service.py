@@ -9,7 +9,10 @@ Speech-to-Text using faster-whisper (CTranslate2 backend).
 • Model is loaded once at startup and reused across all sessions
 """
 
+import os
 import io
+import sys
+import site
 import numpy as np
 import soundfile as sf
 from faster_whisper import WhisperModel
@@ -32,6 +35,17 @@ class STTService:
             f"Loading Whisper model: size={settings.WHISPER_MODEL_SIZE} "
             f"device={settings.WHISPER_DEVICE} compute={settings.WHISPER_COMPUTE_TYPE}"
         )
+        if settings.WHISPER_DEVICE == "cuda" and sys.platform == "win32":
+            # CTranslate2 needs CUDA 12 DLLs in PATH. Pip installs them in site-packages/nvidia/...
+            site_packages = site.getsitepackages()
+            for sp in site_packages:
+                cublas_path = os.path.join(sp, "nvidia", "cublas", "bin")
+                cudnn_path = os.path.join(sp, "nvidia", "cudnn", "bin")
+                if os.path.exists(cublas_path) and cublas_path not in os.environ["PATH"]:
+                    os.environ["PATH"] = f"{cublas_path};{os.environ['PATH']}"
+                if os.path.exists(cudnn_path) and cudnn_path not in os.environ["PATH"]:
+                    os.environ["PATH"] = f"{cudnn_path};{os.environ['PATH']}"
+                    
         self._model = WhisperModel(
             settings.WHISPER_MODEL_SIZE,
             device=settings.WHISPER_DEVICE,
@@ -87,12 +101,14 @@ class STTService:
         if len(audio_np) < 1600:
             return {"text": "", "language": language, "confidence": 0.0, "segments": []}
 
+        import time
+        start_t = time.time()
+        
         segments_iter, info = self._model.transcribe(
             audio_np,
             language=language,
-            beam_size=3,          # reduced beam for faster CPU inference
-            vad_filter=True,      # built-in VAD to skip silence
-            vad_parameters={"min_silence_duration_ms": 300},
+            beam_size=3,          # reduced beam for faster inference
+            vad_filter=False,     # DISABLED: our external VAD already verified speech exists
         )
 
         segments = []
@@ -107,7 +123,14 @@ class STTService:
             full_text_parts.append(seg.text.strip())
 
         full_text = " ".join(full_text_parts).strip()
-        logger.info(f"STT transcript: '{full_text}' (lang={info.language})")
+        elapsed = time.time() - start_t
+        audio_dur = len(audio_np) / 16000.0
+        
+        logger.info(
+            f"STT: '{full_text}' | "
+            f"Audio: {audio_dur:.1f}s | Infer: {elapsed:.2f}s | "
+            f"Speed: {(audio_dur/elapsed if elapsed > 0 else 0):.1f}x realtime"
+        )
 
         return {
             "text": full_text,

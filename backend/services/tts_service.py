@@ -14,7 +14,13 @@ import wave
 import subprocess
 import tempfile
 import os
+import re as _re
+from datetime import datetime
 from pathlib import Path
+
+# Directory where synthesised WAV files are saved for inspection
+_TTS_OUTPUT_DIR = Path(__file__).resolve().parent.parent / "tts_output"
+_TTS_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 from core.config import settings
 from utils.logger import get_logger
 
@@ -68,7 +74,7 @@ class TTSService:
 
     def synthesise(self, text: str) -> bytes:
         """
-        Convert text → WAV audio bytes.
+        Convert text → WAV audio bytes and save a copy to tts_output/.
 
         Args:
             text: Plain text sentence (no markdown, no SSML)
@@ -85,15 +91,55 @@ class TTSService:
         # Clean text — remove any stray markdown characters
         clean = text.replace("*", "").replace("#", "").replace("`", "").strip()
 
-        if self._use_python_api:
-            return self._synth_python(clean)
-        return self._synth_subprocess(clean)
+        wav_bytes = self._synth_python(clean) if self._use_python_api else self._synth_subprocess(clean)
+
+        # if wav_bytes:
+        #     self._save_to_file(clean, wav_bytes)
+
+        return wav_bytes
+
+    # def _save_to_file(self, text: str, wav_bytes: bytes) -> None:
+    #     """Persist WAV bytes to tts_output/ with a timestamp + text slug filename."""
+    #     try:
+    #         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    #         slug = _re.sub(r"[^\w]+", "_", text[:40]).strip("_").lower()
+    #         filename = _TTS_OUTPUT_DIR / f"{timestamp}_{slug}.wav"
+    #         filename.write_bytes(wav_bytes)
+    #         logger.debug(f"TTS saved -> {filename.name}")
+    #     except Exception as exc:
+    #         logger.warning(f"TTS file save failed: {exc}")
 
     def _synth_python(self, text: str) -> bytes:
-        """Synthesise using piper Python bindings (faster, in-process)."""
+        """
+        Synthesise using piper Python bindings.
+
+        Piper's synthesize() is a GENERATOR that yields AudioChunk objects
+        (float32 numpy arrays). We must iterate them, convert float32→int16
+        PCM, and write the frames into the WAV container manually.
+        """
+        import numpy as np
+
+        all_frames = bytearray()
+        sample_rate = 22050  # will be overridden by first chunk
+
+        for chunk in self._voice.synthesize(text):
+            sample_rate = chunk.sample_rate
+            # float32 [-1,1] → int16 [-32768,32767]
+            audio_int16 = (
+                np.clip(chunk.audio_float_array, -1.0, 1.0) * 32767
+            ).astype(np.int16)
+            all_frames.extend(audio_int16.tobytes())
+
+        if not all_frames:
+            logger.warning("Piper synthesize() yielded no audio frames")
+            return b""
+
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wav:
-            self._voice.synthesize(text, wav)
+            wav.setnchannels(1)
+            wav.setsampwidth(2)   # 16-bit PCM
+            wav.setframerate(sample_rate)
+            wav.writeframes(bytes(all_frames))
         return buf.getvalue()
 
     def _synth_subprocess(self, text: str) -> bytes:

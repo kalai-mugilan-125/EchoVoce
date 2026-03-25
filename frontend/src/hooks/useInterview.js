@@ -53,6 +53,9 @@ export function useInterview() {
         setIsAISpeaking(false)
         setPhase('listening')
         setIsListening(true)
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({ type: 'tts_playback_done' }))
+        }
       }
     }
     audio.onerror = () => {
