@@ -141,6 +141,30 @@ async def _run_pipeline(ws: WebSocket, session: InterviewSession, user_text: str
             logger.info(f"[{session.session_id[:8]}] LLM generation complete. Waiting for TTS playback to finish.")
 
 
+async def _process_audio_streaming(ws: WebSocket, session: InterviewSession, audio_bytes: bytes):
+    """
+    Word-by-word streaming STT. Runs continuously in background thread
+    every 0.5s of new audio to provide real-time frontend feedback.
+    """
+    loop = asyncio.get_event_loop()
+    
+    # transcribe_streaming expects float32 numpy array
+    import numpy as np
+    audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+    audio_np /= 32768.0
+
+    text = await loop.run_in_executor(
+        None,
+        lambda: stt_service.transcribe_streaming(audio_np)
+    )
+    
+    if text:
+        await _send_json(ws, {"type": "transcript_partial", "text": text})
+    
+    # Release streaming lock for this session
+    setattr(session, "is_streaming_stt", False)
+
+
 async def _process_audio(ws: WebSocket, session: InterviewSession, audio_bytes: bytes):
     """STT on accumulated audio → pipeline."""
     loop = asyncio.get_event_loop()
@@ -158,6 +182,11 @@ async def _process_audio(ws: WebSocket, session: InterviewSession, audio_bytes: 
 
     logger.info(f"[{session.session_id[:8]}] STT: '{transcript}'")
     await _send_json(ws, {"type": "transcript", "text": transcript})
+    
+    # Reset streaming state for the next turn
+    setattr(session, "last_streaming_len", 0)
+    setattr(session, "is_streaming_stt", False)
+    
     await _run_pipeline(ws, session, transcript)
 
 
@@ -190,18 +219,14 @@ async def websocket_interview(websocket: WebSocket):
                 if vad_result["interrupt_ai"]:
                     session.request_interrupt()
 
-                if vad_result["should_stop_input"]:
-                    accumulated = bytes(buf)
-                    _audio_buffers[session.session_id] = bytearray()
-                    vad_service.reset()
-
-                    if len(accumulated) > 3200:
-                        logger.info(f"[{session.session_id[:8]}] Sending {len(accumulated)} bytes to STT")
-                        asyncio.create_task(
-                            _process_audio(websocket, session, accumulated)
-                        )
-                    else:
-                        await _send_json(websocket, {"type": "listening"})
+                # ── No auto-stop: silence is now user-controlled via Answer button ──
+                # Only run streaming partial STT for live preview.
+                last_len = getattr(session, "last_streaming_len", 0)
+                if len(buf) - last_len >= 16000:
+                    if not getattr(session, "is_streaming_stt", False):
+                        setattr(session, "last_streaming_len", len(buf))
+                        setattr(session, "is_streaming_stt", True)
+                        asyncio.create_task(_process_audio_streaming(websocket, session, bytes(buf)))
 
             # ── Text: JSON control ───────────────────────────
             elif message.get("text"):
@@ -222,6 +247,8 @@ async def websocket_interview(websocket: WebSocket):
                         session = session_manager.create()
 
                     _audio_buffers[session.session_id] = bytearray()
+                    setattr(session, "last_streaming_len", 0)
+                    setattr(session, "is_streaming_stt", False)
                     vad_service.reset()
 
                     # Seed system prompt
@@ -261,6 +288,25 @@ async def websocket_interview(websocket: WebSocket):
                         session_manager.delete(session.session_id)
                         _audio_buffers.pop(session.session_id, None)
                     break
+
+                elif msg_type == "submit_answer":
+                    # User clicked the Answer button — run final STT on everything recorded so far
+                    if session:
+                        buf = _audio_buffers.get(session.session_id, bytearray())
+                        accumulated = bytes(buf)
+                        _audio_buffers[session.session_id] = bytearray()
+                        setattr(session, "last_streaming_len", 0)
+                        setattr(session, "is_streaming_stt", False)
+                        vad_service.reset()
+
+                        if len(accumulated) > 3200:
+                            logger.info(f"[{session.session_id[:8]}] Answer submitted — {len(accumulated)} bytes to STT")
+                            asyncio.create_task(
+                                _process_audio(websocket, session, accumulated)
+                            )
+                        else:
+                            logger.info(f"[{session.session_id[:8]}] Answer submitted but buffer too small — re-listening")
+                            await _send_json(websocket, {"type": "listening"})
 
                 elif msg_type == "interrupt":
                     if session:

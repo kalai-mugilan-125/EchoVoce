@@ -31,10 +31,10 @@ const PHASE_BADGE = {
 
 export default function InterviewRoom({ sessionId, style, onEnd }) {
   const {
-    phase, transcript, aiSentence,
+    phase, transcript, partialTranscript, aiSentence,
     isAISpeaking, isListening,
-    silenceTimer, error,
-    connect, disconnect,
+    error,
+    connect, disconnect, submitAnswer,
   } = useInterview()
 
   const transcriptRef  = useRef(null)
@@ -251,6 +251,42 @@ export default function InterviewRoom({ sessionId, style, onEnd }) {
               </div>
             ))}
 
+            {partialTranscript && (
+              <div
+                style={{
+                  display: 'flex',
+                  flexDirection: 'row-reverse',
+                  gap: '10px',
+                  alignItems: 'flex-start',
+                  animation: 'fadeUp 0.3s ease forwards',
+                  opacity: 0.7,
+                }}
+              >
+                <div style={{
+                  width: '30px', height: '30px', borderRadius: '50%', flexShrink: 0,
+                  background: 'linear-gradient(135deg, #43e97b, #38f9d7)',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  fontSize: '14px',
+                }}>
+                  🧑
+                </div>
+
+                <div style={{
+                  maxWidth: '78%',
+                  padding: '10px 14px',
+                  borderRadius: '16px 4px 16px 16px',
+                  background: 'rgba(67,233,123,0.1)',
+                  border: '1px solid rgba(67,233,123,0.2)',
+                  fontSize: '14px',
+                  lineHeight: 1.6,
+                  color: 'var(--text-primary)',
+                }}>
+                  {partialTranscript}
+                  <span className="pulse-dot" style={{ display: 'inline-block', marginLeft: '6px', background: 'var(--text-primary)' }} />
+                </div>
+              </div>
+            )}
+
             {phase === 'processing' && (
               <div style={{ display: 'flex', gap: '10px', alignItems: 'flex-start' }}>
                 <div style={{
@@ -288,16 +324,6 @@ export default function InterviewRoom({ sessionId, style, onEnd }) {
 
         <Waveform active={isListening} speaking={false} />
 
-        {silenceTimer > 0 && (
-          <div style={{
-            fontSize: '13px', color: 'var(--text-secondary)',
-            display: 'flex', alignItems: 'center', gap: '6px', flexShrink: 0,
-          }}>
-            <div className="pulse-dot amber" />
-            Sending in {silenceTimer}s
-          </div>
-        )}
-
         <div style={{ marginLeft: 'auto', fontSize: '12px', color: 'var(--text-muted)', flexShrink: 0 }}>
           {isListening
             ? 'Listening — speak naturally'
@@ -307,6 +333,30 @@ export default function InterviewRoom({ sessionId, style, onEnd }) {
             ? 'Processing your response...'
             : PHASE_LABEL[phase]}
         </div>
+
+        {/* Answer button — only active while listening */}
+        <button
+          onClick={submitAnswer}
+          disabled={!isListening}
+          style={{
+            flexShrink: 0,
+            padding: '10px 22px',
+            borderRadius: 'var(--radius-md)',
+            border: 'none',
+            cursor: isListening ? 'pointer' : 'not-allowed',
+            fontWeight: 700,
+            fontSize: '14px',
+            letterSpacing: '0.03em',
+            transition: 'all 0.25s',
+            background: isListening
+              ? 'linear-gradient(135deg, #43e97b, #38f9d7)'
+              : 'rgba(255,255,255,0.08)',
+            color: isListening ? '#0a0a0a' : 'var(--text-muted)',
+            boxShadow: isListening ? '0 0 18px rgba(67,233,123,0.35)' : 'none',
+          }}
+        >
+          {phase === 'processing' ? '⏳ Processing...' : '✓ Submit Answer'}
+        </button>
       </div>
     </div>
   )

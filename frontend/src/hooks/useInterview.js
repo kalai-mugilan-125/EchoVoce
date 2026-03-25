@@ -17,10 +17,10 @@ const SAMPLE_RATE = 16000
 export function useInterview() {
   const [phase, setPhase]               = useState('idle')
   const [transcript, setTranscript]     = useState([])
+  const [partialTranscript, setPartialTranscript] = useState('')
   const [aiSentence, setAiSentence]     = useState('')
   const [isAISpeaking, setIsAISpeaking] = useState(false)
   const [isListening, setIsListening]   = useState(false)
-  const [silenceTimer, setSilenceTimer] = useState(0)
   const [error, setError]               = useState(null)
   const [sessionId, setSessionId]       = useState(null)
 
@@ -30,7 +30,6 @@ export function useInterview() {
   const audioCtxRef     = useRef(null)
   const audioQueueRef   = useRef([])
   const isPlayingRef    = useRef(false)
-  const silenceRef      = useRef(null)
   const hasSpeechRef    = useRef(false)
   const connectedRef    = useRef(false)  // guards against StrictMode double-mount
 
@@ -78,22 +77,6 @@ export function useInterview() {
     setIsAISpeaking(false)
   }, [])
 
-  // ── Silence timer UI ──────────────────────────────────
-  const startSilenceTimer = useCallback(() => {
-    clearInterval(silenceRef.current)
-    setSilenceTimer(5)
-    let count = 5
-    silenceRef.current = setInterval(() => {
-      count -= 1
-      setSilenceTimer(count)
-      if (count <= 0) clearInterval(silenceRef.current)
-    }, 1000)
-  }, [])
-
-  const resetSilenceTimer = useCallback(() => {
-    clearInterval(silenceRef.current)
-    setSilenceTimer(0)
-  }, [])
 
   // ── WebSocket message handler ─────────────────────────
   const handleWSMessage = useCallback((event) => {
@@ -120,11 +103,17 @@ export function useInterview() {
       case 'transcript':
         if (msg.text) {
           setTranscript(prev => [...prev, { role: 'user', text: msg.text, ts: Date.now() }])
-          resetSilenceTimer()
+          setPartialTranscript('') // Clear partial transcript on final
           hasSpeechRef.current = false
         }
         setPhase('processing')
         setIsListening(false)
+        break
+
+      case 'transcript_partial':
+        if (msg.text) {
+          setPartialTranscript(msg.text)
+        }
         break
 
       case 'tts_start':
@@ -146,8 +135,7 @@ export function useInterview() {
       case 'listening':
         setPhase('listening')
         setIsListening(true)
-        // Bug 4 fix: tell the mic handler a new turn started so the
-        // silence countdown can fire again for this turn
+        // Reset speech gate so a new turn starts fresh
         hasSpeechRef.current = false
         break
 
@@ -167,7 +155,7 @@ export function useInterview() {
       default:
         break
     }
-  }, [enqueueAudio, resetSilenceTimer, stopAudioPlayback])
+  }, [enqueueAudio, stopAudioPlayback])
 
   // ── Microphone capture ────────────────────────────────
   const startMic = useCallback(async () => {
@@ -191,9 +179,6 @@ export function useInterview() {
       const processor = new AudioWorkletNode(audioCtx, 'audio-processor')
       processorRef.current = processor
 
-      let lastSpeechTime = Date.now()
-      let silenceStarted = false
-
       // Handle messages from the worklet
       processor.port.onmessage = (event) => {
         if (event.data.type !== 'audiodata') return
@@ -206,27 +191,16 @@ export function useInterview() {
         const hasSpeech = rms > 0.008
 
         if (hasSpeech) {
-          lastSpeechTime       = Date.now()
           hasSpeechRef.current = true
-          silenceStarted       = false
-          resetSilenceTimer()
 
-          // Bug 3 fix: interrupt AI if user starts speaking while TTS plays
+          // Interrupt AI if user starts speaking while TTS plays
           if (isPlayingRef.current) {
             stopAudioPlayback()
             ws.send(JSON.stringify({ type: 'interrupt' }))
           }
-        } else {
-          const silenceDur = (Date.now() - lastSpeechTime) / 1000
-          if (silenceDur >= 1 && !silenceStarted && hasSpeechRef.current) {
-            silenceStarted = true
-            startSilenceTimer()
-          }
         }
 
-        // Bug 3 fix: do NOT send audio bytes while AI is speaking TTS.
-        // The backend ignores them anyway, but sending wastes bandwidth and
-        // can confuse the VAD silence timer on the next turn.
+        // Do NOT send audio bytes while AI is speaking TTS.
         if (isPlayingRef.current) return
 
         // float32 → int16 PCM → send
@@ -253,8 +227,7 @@ export function useInterview() {
     audioCtxRef.current = null
     mediaStreamRef.current?.getTracks().forEach(t => t.stop())
     mediaStreamRef.current = null
-    resetSilenceTimer()
-  }, [resetSilenceTimer])
+  }, [])
 
   // ── Connect ───────────────────────────────────────────
   const connect = useCallback((sid, style = 'mixed') => {
@@ -285,6 +258,17 @@ export function useInterview() {
       connectedRef.current = false
     }
   }, [handleWSMessage, startMic, stopMic])
+
+  // ── Submit Answer ─────────────────────────────────────
+  const submitAnswer = useCallback(() => {
+    const ws = wsRef.current
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'submit_answer' }))
+      setPhase('processing')
+      setIsListening(false)
+      setPartialTranscript('')
+    }
+  }, [])
 
   // ── Disconnect ────────────────────────────────────────
   const disconnect = useCallback(() => {
@@ -317,7 +301,6 @@ export function useInterview() {
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      clearInterval(silenceRef.current)
       const ws = wsRef.current
       if (ws && ws.readyState === WebSocket.OPEN) {
         try { ws.send(JSON.stringify({ type: 'end' })) } catch (_) {}
@@ -328,9 +311,9 @@ export function useInterview() {
   }, [stopMic])
 
   return {
-    phase, transcript, aiSentence,
+    phase, transcript, partialTranscript, aiSentence,
     isAISpeaking, isListening,
-    silenceTimer, error, sessionId,
-    connect, disconnect,
+    error, sessionId,
+    connect, disconnect, submitAnswer,
   }
 }
