@@ -34,6 +34,7 @@ export default function InterviewRoom({ sessionId, style, onEnd }) {
     phase, transcript, partialTranscript, aiSentence,
     isAISpeaking, isListening,
     error,
+    isRecording, startRecording, stopRecording,
     connect, disconnect, submitAnswer,
   } = useInterview()
 
@@ -42,11 +43,9 @@ export default function InterviewRoom({ sessionId, style, onEnd }) {
 
   // Connect exactly once — safe against StrictMode double-mount
   useEffect(() => {
-    if (didConnectRef.current) return
-    didConnectRef.current = true
     connect(sessionId, style)
     return () => disconnect()
-  }, [])
+  }, [connect, disconnect, sessionId, style])
 
   // Auto-scroll transcript
   useEffect(() => {
@@ -325,14 +324,33 @@ export default function InterviewRoom({ sessionId, style, onEnd }) {
         <Waveform active={isListening} speaking={false} />
 
         <div style={{ marginLeft: 'auto', fontSize: '12px', color: 'var(--text-muted)', flexShrink: 0 }}>
-          {isListening
-            ? 'Listening — speak naturally'
+          {isRecording 
+            ? 'Recording — speak your answer'
+            : isListening
+            ? 'Ready to record'
             : isAISpeaking
             ? 'AI speaking — interrupt anytime'
             : phase === 'processing'
             ? 'Processing your response...'
             : PHASE_LABEL[phase]}
         </div>
+
+        {/* Record Control */}
+        {isListening && phase !== 'processing' && (
+          <button
+            onClick={isRecording ? stopRecording : startRecording}
+            style={{
+              flexShrink: 0, padding: '10px 22px', borderRadius: 'var(--radius-md)',
+              cursor: 'pointer', fontWeight: 700, fontSize: '14px',
+              transition: 'all 0.25s',
+              background: isRecording ? 'rgba(245,87,108,0.1)' : 'rgba(67,233,123,0.1)',
+              color: isRecording ? '#f5576c' : '#43e97b',
+              border: `1px solid ${isRecording ? 'rgba(245,87,108,0.4)' : 'rgba(67,233,123,0.4)'}`,
+            }}
+          >
+            {isRecording ? '⏹ Stop Recording' : '⏺ Start Recording'}
+          </button>
+        )}
 
         {/* Answer button — only active while listening */}
         <button

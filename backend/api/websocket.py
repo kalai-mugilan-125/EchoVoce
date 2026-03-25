@@ -199,6 +199,9 @@ async def websocket_interview(websocket: WebSocket):
     try:
         while True:
             message = await websocket.receive()
+            
+            if message.get("type") == "websocket.disconnect":
+                raise WebSocketDisconnect(message.get("code", 1000))
 
             # ── Binary: audio chunk ──────────────────────────
             if message.get("bytes"):
@@ -206,7 +209,11 @@ async def websocket_interview(websocket: WebSocket):
 
                 # Ignore audio while AI is speaking
                 if session is None or session.is_ai_speaking:
+                    logger.debug(f"Audio chunk dropped: session={session}, ai_speaking={session.is_ai_speaking if session else 'None'}")
                     continue
+
+                if len(audio_chunk) > 0:
+                    logger.info(f"Received audio chunk size: {len(audio_chunk)}")
 
                 buf = _audio_buffers.setdefault(session.session_id, bytearray())
                 buf.extend(audio_chunk)
@@ -290,6 +297,7 @@ async def websocket_interview(websocket: WebSocket):
                     break
 
                 elif msg_type == "submit_answer":
+                    logger.info("Received message: submit_answer")
                     # User clicked the Answer button — run final STT on everything recorded so far
                     if session:
                         buf = _audio_buffers.get(session.session_id, bytearray())

@@ -21,6 +21,7 @@ export function useInterview() {
   const [aiSentence, setAiSentence]     = useState('')
   const [isAISpeaking, setIsAISpeaking] = useState(false)
   const [isListening, setIsListening]   = useState(false)
+  const [isRecording, setIsRecording]   = useState(false)
   const [error, setError]               = useState(null)
   const [sessionId, setSessionId]       = useState(null)
 
@@ -31,6 +32,7 @@ export function useInterview() {
   const audioQueueRef   = useRef([])
   const isPlayingRef    = useRef(false)
   const hasSpeechRef    = useRef(false)
+  const isRecordingRef  = useRef(false)
   const connectedRef    = useRef(false)  // guards against StrictMode double-mount
 
   // ── Audio playback queue ──────────────────────────────
@@ -53,7 +55,10 @@ export function useInterview() {
         setPhase('listening')
         setIsListening(true)
         if (wsRef.current?.readyState === WebSocket.OPEN) {
-          wsRef.current.send(JSON.stringify({ type: 'tts_playback_done' }))
+          console.log("FRONTEND: Sending tts_complete")
+          wsRef.current.send(JSON.stringify({ type: 'tts_complete' }))
+        } else {
+          console.warn("FRONTEND: Could not send tts_complete, WS not open")
         }
       }
     }
@@ -75,6 +80,19 @@ export function useInterview() {
     audioQueueRef.current = []
     isPlayingRef.current  = false
     setIsAISpeaking(false)
+  }, [])
+
+  // ── Recording Control ─────────────────────────────────
+  const startRecording = useCallback(() => {
+    console.log("FRONTEND: startRecording triggered. isRecordingRef set to true.")
+    setIsRecording(true)
+    isRecordingRef.current = true
+  }, [])
+
+  const stopRecording = useCallback(() => {
+    console.log("FRONTEND: stopRecording triggered. isRecordingRef set to false.")
+    setIsRecording(false)
+    isRecordingRef.current = false
   }, [])
 
 
@@ -203,6 +221,14 @@ export function useInterview() {
         // Do NOT send audio bytes while AI is speaking TTS.
         if (isPlayingRef.current) return
 
+        // Only stream user speech to the backend if explicitly recording
+        if (!isRecordingRef.current) return
+
+        if (!window.__loggedAudioChunk) {
+          console.log("FRONTEND: Worklet is actively streaming audio bytes to WS!")
+          window.__loggedAudioChunk = true
+        }
+
         // float32 → int16 PCM → send
         const int16 = new Int16Array(float32.length)
         for (let i = 0; i < float32.length; i++) {
@@ -218,7 +244,7 @@ export function useInterview() {
     } catch (err) {
       setError(`Microphone error: ${err.message}`)
     }
-  }, [resetSilenceTimer, startSilenceTimer, stopAudioPlayback])
+  }, [stopAudioPlayback])
 
   const stopMic = useCallback(() => {
     processorRef.current?.disconnect()
@@ -231,10 +257,6 @@ export function useInterview() {
 
   // ── Connect ───────────────────────────────────────────
   const connect = useCallback((sid, style = 'mixed') => {
-    // Guard: React StrictMode mounts twice in dev — skip second mount
-    if (connectedRef.current) return
-    connectedRef.current = true
-
     setPhase('connecting')
     setError(null)
 
@@ -261,14 +283,19 @@ export function useInterview() {
 
   // ── Submit Answer ─────────────────────────────────────
   const submitAnswer = useCallback(() => {
+    console.log("FRONTEND: submitAnswer clicked! Attempting to send submit_answer.", wsRef.current?.readyState)
+    stopRecording()
     const ws = wsRef.current
     if (ws?.readyState === WebSocket.OPEN) {
+      console.log("FRONTEND: Successfully sent submit_answer to backend.")
       ws.send(JSON.stringify({ type: 'submit_answer' }))
       setPhase('processing')
       setIsListening(false)
       setPartialTranscript('')
+    } else {
+      console.error("FRONTEND Error: submitAnswer could not send, WS is not OPEN (ready state: " + ws?.readyState + ")")
     }
-  }, [])
+  }, [stopRecording])
 
   // ── Disconnect ────────────────────────────────────────
   const disconnect = useCallback(() => {
@@ -278,11 +305,11 @@ export function useInterview() {
       if (ws.readyState === WebSocket.OPEN) {
         try { ws.send(JSON.stringify({ type: 'end' })) } catch (_) {}
       }
+      try { ws.close() } catch (_) {}
       wsRef.current = null
     }
     stopMic()
     stopAudioPlayback()
-    connectedRef.current = false
     setPhase('ended')
     setIsListening(false)
   }, [stopMic, stopAudioPlayback])
@@ -302,9 +329,11 @@ export function useInterview() {
   useEffect(() => {
     return () => {
       const ws = wsRef.current
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        try { ws.send(JSON.stringify({ type: 'end' })) } catch (_) {}
-        ws.close()
+      if (ws) {
+        if (ws.readyState === WebSocket.OPEN) {
+          try { ws.send(JSON.stringify({ type: 'end' })) } catch (_) {}
+        }
+        try { ws.close() } catch (_) {}
       }
       stopMic()
     }
@@ -314,6 +343,7 @@ export function useInterview() {
     phase, transcript, partialTranscript, aiSentence,
     isAISpeaking, isListening,
     error, sessionId,
+    isRecording, startRecording, stopRecording,
     connect, disconnect, submitAnswer,
   }
 }

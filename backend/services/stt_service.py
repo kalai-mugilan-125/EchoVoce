@@ -89,6 +89,8 @@ class STTService:
         Returns dict with:
             text (str), language (str), confidence (float), segments (list)
         """
+        logger.info(f"STT: Received {len(audio_bytes)} bytes of audio data for transcription.")
+        
         if not self._is_loaded:
             self.load()
 
@@ -144,6 +146,8 @@ class STTService:
         Lightweight transcription for streaming use.
         Returns only the text string (no metadata).
         """
+        logger.info(f"STT Streaming: Received {len(audio_np)} frames for transcription.")
+        
         if not self._is_loaded:
             self.load()
 
