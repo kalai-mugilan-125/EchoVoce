@@ -31,6 +31,7 @@ class InterviewSession:
     # Context injected into LLM
     resume_text: str = ""
     job_description: str = ""
+    candidate_name: str = ""  # extracted from resume; injected explicitly into prompt
 
     # Conversation history (kept trimmed to avoid context overflow)
     history: list[Message] = field(default_factory=list)
@@ -43,12 +44,41 @@ class InterviewSession:
     # Interrupt flag: set True when user speaks while AI is talking
     interrupt_requested: bool = False
 
+    # ── Token-budget-aware history trimming ──────────────────
+    # n_ctx=163840 total. We reserve:
+    #   ~2500 tokens for system prompt (base + resume + JD)
+    #   ~512  tokens for the next LLM response
+    # That leaves ~130000 tokens for actual conversation history.
+    # Rough estimate: 1 token ≈ 4 chars.
+    HISTORY_TOKEN_BUDGET = 130000
+    CHARS_PER_TOKEN      = 4
+
     def add_message(self, role: str, content: str):
         self.history.append(Message(role=role, content=content))
-        # Keep last 20 turns to avoid LLM context overflow on CPU
-        if len(self.history) > 20:
-            # Always preserve the system message at index 0
-            self.history = self.history[:1] + self.history[-19:]
+        self._trim_history()
+
+    def _trim_history(self):
+        """Keep the system prompt + as many recent messages as fit in budget."""
+        if not self.history:
+            return
+
+        # Always keep the system prompt (index 0)
+        system = self.history[:1]
+        turns  = self.history[1:]
+
+        budget_chars = self.HISTORY_TOKEN_BUDGET * self.CHARS_PER_TOKEN
+
+        # Walk from newest → oldest, accumulate until budget exceeded
+        kept: list[Message] = []
+        used = 0
+        for msg in reversed(turns):
+            msg_chars = len(msg.content)
+            if used + msg_chars > budget_chars and kept:
+                break   # stop before exceeding; always keep at least 1 turn
+            kept.append(msg)
+            used += msg_chars
+
+        self.history = system + list(reversed(kept))
 
     def get_history_dicts(self) -> list[dict]:
         """Return history as list of {role, content} for LLM input."""

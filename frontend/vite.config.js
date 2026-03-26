@@ -9,7 +9,7 @@ export default defineConfig({
       '/upload': 'http://localhost:8000',
       '/health': 'http://localhost:8000',
       '/ws': {
-        target: 'https://localhost:8000',
+        target: 'http://localhost:8000',
         ws: true,
       },
     },

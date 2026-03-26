@@ -12,6 +12,7 @@ The session_id ties the uploaded context to the WS interview session.
 
 import uuid
 import aiofiles
+import asyncio
 from pathlib import Path
 from fastapi import APIRouter, File, UploadFile, Form, HTTPException
 from fastapi.responses import JSONResponse
@@ -20,9 +21,45 @@ from core.config import settings
 from core.session_manager import session_manager
 from utils.resume_parser import parse_resume
 from utils.logger import get_logger
+from services.llm_service import llm_service
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/upload", tags=["upload"])
+
+async def _extract_name_via_llm(resume_text: str) -> str:
+    """Uses the local LLM to reliably extract the candidate name, bypassing PDF layout quirks."""
+    if not resume_text:
+        return ""
+        
+    prompt = (
+        "Identify the candidate's full name from the following resume text. "
+        "Reply with ONLY their name, and absolutely nothing else. "
+        "Do not include punctuation or titles. "
+        "If you cannot determine a person's name, reply with 'Unknown'.\n\n"
+        f"Resume text:\n{resume_text[:2000]}"
+    )
+    
+    # Run blocking inference in a background thread to keep FastAPI responsive
+    messages = [{"role": "user", "content": prompt}]
+    try:
+        raw_name = await asyncio.to_thread(llm_service.generate, messages, False)
+        name = raw_name.strip()
+        
+        # Cleanup in case the LLM ignored instructions and answered verbosely
+        if "name is" in name.lower():
+            name = name.split("is")[-1].strip(" '\".,\n")
+        if name.lower() == "unknown":
+            return ""
+            
+        # Ensure it's not a hallucinated full paragraph
+        if len(name) > 40 or "\n" in name:
+            return ""
+            
+        logger.info(f"LLM extracted candidate name: '{name}'")
+        return name
+    except Exception as e:
+        logger.error(f"Failed to extract name via LLM: {e}")
+        return ""
 
 MAX_BYTES = settings.MAX_UPLOAD_MB * 1024 * 1024
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".doc", ".txt"}
@@ -91,9 +128,12 @@ async def upload_resume(
 
     # Store in session
     session.resume_text = resume_text
+    session.candidate_name = await _extract_name_via_llm(resume_text)
+
+    name_log = f" | name='{session.candidate_name}'" if session.candidate_name else ""
     logger.info(
         f"Resume uploaded for session {session_id[:8]}: "
-        f"{len(resume_text)} chars from '{file.filename}'"
+        f"{len(resume_text)} chars from '{file.filename}'{name_log}"
     )
 
     return {

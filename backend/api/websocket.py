@@ -270,22 +270,12 @@ async def websocket_interview(websocket: WebSocket):
 
                     logger.info(
                         f"[{session.session_id[:8]}] Started | style={style} | "
-                        f"resume={'yes' if session.resume_text else 'no'} | "
-                        f"jd={'yes' if session.job_description else 'no'}"
+                        f"resume={'yes (' + str(len(session.resume_text)) + ' chars)' if session.resume_text else 'no'} | "
+                        f"jd={'yes (' + str(len(session.job_description)) + ' chars)' if session.job_description else 'no'}"
                     )
 
                     # Trigger greeting — inject synthetic first message
-                    if session.has_context():
-                        trigger = (
-                            "Please greet the candidate warmly by name if available, "
-                            "then ask your first interview question based on their resume "
-                            "and the job description."
-                        )
-                    else:
-                        trigger = (
-                            "Please greet the candidate warmly and ask your first "
-                            "general interview question."
-                        )
+                    trigger = "Hello, I am ready to start the interview."
 
                     asyncio.create_task(_run_pipeline(websocket, session, trigger))
 
@@ -329,8 +319,14 @@ async def websocket_interview(websocket: WebSocket):
                 elif msg_type == "ping":
                     await _send_json(websocket, {"type": "pong"})
 
-    except WebSocketDisconnect:
-        logger.info(f"WS disconnected: {session.session_id[:8] if session else '?'}")
+    except (WebSocketDisconnect, RuntimeError) as e:
+        # RuntimeError fires when receive() is called after the client already
+        # sent a disconnect frame — treat it the same as a clean disconnect.
+        msg = str(e)
+        if "disconnect" in msg.lower() or isinstance(e, WebSocketDisconnect):
+            logger.info(f"WS disconnected: {session.session_id[:8] if session else '?'}")
+        else:
+            logger.error(f"WS runtime error: {e}", exc_info=True)
     except Exception as e:
         logger.error(f"WS error: {e}", exc_info=True)
         await _send_json(websocket, {"type": "error", "message": str(e)})

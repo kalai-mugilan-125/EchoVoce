@@ -15,25 +15,26 @@ const WS_URL = 'ws://localhost:8000/ws/interview'
 const SAMPLE_RATE = 16000
 
 export function useInterview() {
-  const [phase, setPhase]               = useState('idle')
-  const [transcript, setTranscript]     = useState([])
+  const [phase, setPhase] = useState('idle')
+  const [transcript, setTranscript] = useState([])
   const [partialTranscript, setPartialTranscript] = useState('')
-  const [aiSentence, setAiSentence]     = useState('')
+  const [aiSentence, setAiSentence] = useState('')
   const [isAISpeaking, setIsAISpeaking] = useState(false)
-  const [isListening, setIsListening]   = useState(false)
-  const [isRecording, setIsRecording]   = useState(false)
-  const [error, setError]               = useState(null)
-  const [sessionId, setSessionId]       = useState(null)
+  const [isListening, setIsListening] = useState(false)
+  const [isRecording, setIsRecording] = useState(false)
+  const [error, setError] = useState(null)
+  const [sessionId, setSessionId] = useState(null)
 
-  const wsRef           = useRef(null)
-  const mediaStreamRef  = useRef(null)
-  const processorRef    = useRef(null)
-  const audioCtxRef     = useRef(null)
-  const audioQueueRef   = useRef([])
-  const isPlayingRef    = useRef(false)
-  const hasSpeechRef    = useRef(false)
-  const isRecordingRef  = useRef(false)
-  const connectedRef    = useRef(false)  // guards against StrictMode double-mount
+  const wsRef = useRef(null)
+  const mediaStreamRef = useRef(null)
+  const processorRef = useRef(null)
+  const audioCtxRef = useRef(null)
+  const audioQueueRef = useRef([])
+  const isPlayingRef = useRef(false)
+  const hasSpeechRef = useRef(false)
+  const isRecordingRef = useRef(false)
+  const connectedRef = useRef(false)  // guards against StrictMode double-mount
+  const interruptCountRef = useRef(0)  // debounce: require N consecutive loud chunks to interrupt
 
   // ── Audio playback queue ──────────────────────────────
   const playNextChunk = useCallback(async () => {
@@ -41,8 +42,8 @@ export function useInterview() {
     isPlayingRef.current = true
     setIsAISpeaking(true)
 
-    const blob  = audioQueueRef.current.shift()
-    const url   = URL.createObjectURL(blob)
+    const blob = audioQueueRef.current.shift()
+    const url = URL.createObjectURL(blob)
     const audio = new Audio(url)
 
     audio.onended = () => {
@@ -78,7 +79,7 @@ export function useInterview() {
 
   const stopAudioPlayback = useCallback(() => {
     audioQueueRef.current = []
-    isPlayingRef.current  = false
+    isPlayingRef.current = false
     setIsAISpeaking(false)
   }, [])
 
@@ -205,17 +206,26 @@ export function useInterview() {
         if (!ws || ws.readyState !== WebSocket.OPEN) return
 
         const float32 = event.data.data
-        const rms     = Math.sqrt(float32.reduce((s, v) => s + v * v, 0) / float32.length)
+        const rms = Math.sqrt(float32.reduce((s, v) => s + v * v, 0) / float32.length)
         const hasSpeech = rms > 0.008
 
-        if (hasSpeech) {
-          hasSpeechRef.current = true
-
-          // Interrupt AI if user starts speaking while TTS plays
-          if (isPlayingRef.current) {
-            stopAudioPlayback()
-            ws.send(JSON.stringify({ type: 'interrupt' }))
+        // While AI is playing, use a higher threshold + require N consecutive
+        // loud chunks before firing interrupt — prevents speaker echo/bleed
+        if (isPlayingRef.current) {
+          const INTERRUPT_THRESHOLD = 0.02   // higher than normal 0.008
+          const INTERRUPT_CHUNKS    = 4      // must be loud for 4 chunks in a row
+          if (rms > INTERRUPT_THRESHOLD) {
+            interruptCountRef.current += 1
+            if (interruptCountRef.current >= INTERRUPT_CHUNKS) {
+              interruptCountRef.current = 0
+              stopAudioPlayback()
+              ws.send(JSON.stringify({ type: 'interrupt' }))
+            }
+          } else {
+            interruptCountRef.current = 0  // reset on any quiet chunk
           }
+        } else {
+          interruptCountRef.current = 0
         }
 
         // Do NOT send audio bytes while AI is speaking TTS.
@@ -249,7 +259,7 @@ export function useInterview() {
   const stopMic = useCallback(() => {
     processorRef.current?.disconnect()
     processorRef.current = null
-    audioCtxRef.current?.close().catch(() => {})
+    audioCtxRef.current?.close().catch(() => { })
     audioCtxRef.current = null
     mediaStreamRef.current?.getTracks().forEach(t => t.stop())
     mediaStreamRef.current = null
@@ -257,6 +267,13 @@ export function useInterview() {
 
   // ── Connect ───────────────────────────────────────────
   const connect = useCallback((sid, style = 'mixed') => {
+    // Guard: skip if a socket is already open or connecting
+    const existing = wsRef.current
+    if (existing && existing.readyState < WebSocket.CLOSING) {
+      console.warn('FRONTEND: WebSocket already active — ignoring duplicate connect()')
+      return
+    }
+
     setPhase('connecting')
     setError(null)
 
@@ -271,9 +288,12 @@ export function useInterview() {
 
     ws.onmessage = handleWSMessage
 
-    ws.onerror = () => setError('WebSocket connection failed. Is the backend running?')
+    ws.onerror = () => {
+      setError('WebSocket connection failed. Is the backend running?')
+    }
 
     ws.onclose = () => {
+      if (wsRef.current === ws) wsRef.current = null
       stopMic()
       setIsListening(false)
       setIsAISpeaking(false)
@@ -303,9 +323,9 @@ export function useInterview() {
     if (ws) {
       // Only send if socket is actually open — avoids InvalidStateError
       if (ws.readyState === WebSocket.OPEN) {
-        try { ws.send(JSON.stringify({ type: 'end' })) } catch (_) {}
+        try { ws.send(JSON.stringify({ type: 'end' })) } catch (_) { }
       }
-      try { ws.close() } catch (_) {}
+      try { ws.close() } catch (_) { }
       wsRef.current = null
     }
     stopMic()
@@ -325,16 +345,23 @@ export function useInterview() {
     return () => clearInterval(id)
   }, [])
 
-  // Cleanup on unmount
+  // Cleanup on unmount.
+  // Null out all handlers BEFORE closing so a stale socket from React
+  // StrictMode's first-pass unmount cannot call stopMic / setState
+  // on the fresh second-mount instance.
   useEffect(() => {
     return () => {
       const ws = wsRef.current
       if (ws) {
-        if (ws.readyState === WebSocket.OPEN) {
-          try { ws.send(JSON.stringify({ type: 'end' })) } catch (_) {}
-        }
-        try { ws.close() } catch (_) {}
+        // Silence the socket — prevents stale callbacks from firing
+        ws.onopen    = null
+        ws.onmessage = null
+        ws.onerror   = null
+        ws.onclose   = null
+        wsRef.current = null
+        try { ws.close() } catch (_) { }
       }
+      connectedRef.current = false
       stopMic()
     }
   }, [stopMic])
