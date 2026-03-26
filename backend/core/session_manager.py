@@ -48,7 +48,7 @@ class InterviewSession:
     # n_ctx=163840 total. We reserve:
     #   ~2500 tokens for system prompt (base + resume + JD)
     #   ~512  tokens for the next LLM response
-    # That leaves ~130000 tokens for actual conversation history.
+    # That leaves ~130000  tokens for actual conversation history.
     # Rough estimate: 1 token ≈ 4 chars.
     HISTORY_TOKEN_BUDGET = 130000
     CHARS_PER_TOKEN      = 4
